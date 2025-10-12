@@ -22,7 +22,7 @@ pub mod time;
 
 const ENDPOINT_CREATION_THROTTLE_NS: u64 = Duration::from_secs(1).as_nanos() as u64;
 
-const DNS_RESOLVE_TIMEOUT_NS: u64 = Duration::from_secs(5).as_nanos() as u64;
+const DNS_RESOLVE_TIMEOUT_NS: u64 = Duration::from_secs(60).as_nanos() as u64;
 
 /// Endpoint handle.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
