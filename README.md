@@ -19,7 +19,7 @@ particularly focusing on TCP stream-oriented clients that utilise various protoc
 Simply declare dependency on `boomnet` in your `Cargo.toml` and select desired [features](#features).
 ```toml
 [dependencies]
-boomnet = { version = "0.0.73", features = ["rustls-webpki", "ws", "ext"]}
+boomnet = { version = "0.0.75", features = ["rustls-webpki", "ws", "ext"]}
 ```
 
 ## Design Principles
@@ -63,7 +63,7 @@ let mut io_service = MioSelector::new()?.into_io_service();
 The last layer manages lifecycle of endpoints and provides auxiliary services (such as asynchronous DNS resolution and
 auto disconnect) through the `IOService`.
 
-`Endpoint` serves as low level construct for application logic. `IOService` oversees the connection lifecycle within endpoints.
+`Endpoint` serves as connection factory and is where application logic lives. `IOService` oversees the connection lifecycle within endpoints.
 
 ## Protocols
 The aim is to support a variety of protocols, including WebSocket, HTTP, and FIX.
@@ -218,6 +218,7 @@ The framework feature set is modular, allowing for tailored functionality based 
 * [rustls-native](#rustls-native)
 * [rustls-webpki](#rustls-webpki)
 * [openssl](#openssl)
+* [ktls](#ktls)
 * [ext](#ext)
 * [ws](#ws)
 * [http](#http)
@@ -233,6 +234,9 @@ Adds dependency on `rustls` crate with `webpki-roots` and enables `TlsStream` as
 
 ### `openssl`
 Adds dependency on `openssl` crate and enables `TlsStream` as well as more flexible `TlsReadyStream`.
+
+### `ktls`
+Activates `openssl` feature and enables `KtlsStream` that offloads TLS to the kernel (KTLS).
 
 ### `ext`
 Adds various extensions that provide blanket trait implementations such as `TlsWebsocketEndpoint`.
