@@ -229,7 +229,9 @@ impl<S: Read + Write> Websocket<S> {
 
     #[inline]
     pub fn send_close(&mut self) -> Result<(), Error> {
-        self.send(true, protocol::op::CONNECTION_CLOSE, None)
+        self.send(true, protocol::op::CONNECTION_CLOSE, None)?;
+        self.closed = true;
+        Ok(())
     }
 
     #[inline]
