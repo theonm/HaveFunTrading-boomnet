@@ -228,6 +228,13 @@ impl<S: Read + Write> Websocket<S> {
     }
 
     #[inline]
+    pub fn send_close(&mut self) -> Result<(), Error> {
+        self.send(true, protocol::op::CONNECTION_CLOSE, None)?;
+        self.closed = true;
+        Ok(())
+    }
+
+    #[inline]
     fn next(&mut self) -> Result<Option<WebsocketFrame>, Error> {
         self.ensure_not_closed()?;
         match self.state.next(&mut self.stream) {
