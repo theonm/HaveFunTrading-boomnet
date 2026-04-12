@@ -20,7 +20,7 @@ mod node;
 pub mod select;
 pub mod time;
 
-const ENDPOINT_CREATION_THROTTLE_NS: u64 = Duration::from_secs(1).as_nanos() as u64;
+const ENDPOINT_CREATION_THROTTLE_NS: u64 = Duration::from_millis(250).as_nanos() as u64;
 
 /// Endpoint handle.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
