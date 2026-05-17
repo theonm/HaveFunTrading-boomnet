@@ -121,6 +121,32 @@ impl<S> Websocket<S> {
         }
     }
 
+    /// Same as `new`, but injects extra HTTP header lines into the upgrade request.
+    /// `extra_headers` must be a (possibly multi-line) string where each header line
+    /// ends with `\r\n`. The trailing `\r\n` that terminates the request is appended
+    /// automatically.
+    pub fn new_with_extra_headers(
+        stream: S,
+        endpoint: &str,
+        extra_headers: Option<String>,
+    ) -> Websocket<S>
+    where
+        S: ConnectionInfoProvider,
+    {
+        let connection_info = stream.connection_info().clone();
+        let server_name = connection_info.host();
+        Self {
+            stream,
+            closed: false,
+            state: State::handshake_with_extra_headers(
+                server_name,
+                endpoint,
+                extra_headers,
+                default_buffer_pool_ref(),
+            ),
+        }
+    }
+
     /// Crate a new websocket by wrapping a stream that has already performed handshake. It is the
     /// user's responsibility to make sure the handshake has been completed. Otherwise, can result
     /// in undefined behaviour.
@@ -308,6 +334,18 @@ impl State {
         Self::Handshake(Handshaker::new(server_name, endpoint, &mut pool), pool)
     }
 
+    pub fn handshake_with_extra_headers(
+        server_name: &str,
+        endpoint: &str,
+        extra_headers: Option<String>,
+        mut pool: BufferPoolRef,
+    ) -> Self {
+        Self::Handshake(
+            Handshaker::new_with_extra_headers(server_name, endpoint, &mut pool, extra_headers),
+            pool,
+        )
+    }
+
     pub fn connection(mut pool: BufferPoolRef) -> Self {
         Self::Connection(Decoder::new(&mut pool))
     }
@@ -407,6 +445,14 @@ pub trait IntoWebsocket {
     fn into_websocket(self, endpoint: &str) -> Websocket<Self>
     where
         Self: Sized;
+
+    fn into_websocket_with_extra_headers(
+        self,
+        endpoint: &str,
+        extra_headers: Option<String>,
+    ) -> Websocket<Self>
+    where
+        Self: Sized;
 }
 
 impl<T> IntoWebsocket for T
@@ -418,6 +464,17 @@ where
         Self: Sized,
     {
         Websocket::new(self, endpoint)
+    }
+
+    fn into_websocket_with_extra_headers(
+        self,
+        endpoint: &str,
+        extra_headers: Option<String>,
+    ) -> Websocket<Self>
+    where
+        Self: Sized,
+    {
+        Websocket::new_with_extra_headers(self, endpoint, extra_headers)
     }
 }
 

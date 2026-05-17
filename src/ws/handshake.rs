@@ -15,11 +15,12 @@ use std::io::{Cursor, Read, Write};
 #[derive(Debug)]
 pub struct Handshaker {
     inbound_buffer: OwnedReadBuffer<1>,
-    outbound_buffer: Cursor<[u8; 256]>,
+    outbound_buffer: Cursor<[u8; 16384]>,
     bytes_sent: usize,
     state: HandshakeState,
     server_name: String,
     endpoint: String,
+    extra_headers: Option<String>,
     pending_msg_buffer: VecDeque<(u8, bool, Option<Vec<u8>>)>,
 }
 
@@ -33,13 +34,23 @@ pub enum HandshakeState {
 
 impl Handshaker {
     pub fn new(server_name: &str, endpoint: &str, pool: &mut BufferPoolRef) -> Self {
+        Self::new_with_extra_headers(server_name, endpoint, pool, None)
+    }
+
+    pub fn new_with_extra_headers(
+        server_name: &str,
+        endpoint: &str,
+        pool: &mut BufferPoolRef,
+        extra_headers: Option<String>,
+    ) -> Self {
         Self {
             inbound_buffer: pool.acquire(),
-            outbound_buffer: Cursor::new([0; 256]),
+            outbound_buffer: Cursor::new([0; 16384]),
             bytes_sent: 0,
             state: NotStarted,
             server_name: server_name.to_string(),
             endpoint: endpoint.to_string(),
+            extra_headers,
             pending_msg_buffer: VecDeque::with_capacity(256),
         }
     }
@@ -80,8 +91,13 @@ impl Handshaker {
                     let mut response = Response::new(&mut headers);
                     response.parse(self.inbound_buffer.view()).map_err(io::Error::other)?;
                     if response.code.unwrap() != StatusCode::SWITCHING_PROTOCOLS.as_u16() {
-                        let reason = response.reason.unwrap_or_default();
-                        return Err(io::Error::other(format!("unable to switch protocols, reason: {}", reason)));
+                        let code = response.code.unwrap_or(0);
+                        let reason = response.reason.unwrap_or_default().to_string();
+                        let raw = String::from_utf8_lossy(self.inbound_buffer.view()).to_string();
+                        return Err(io::Error::other(format!(
+                            "unable to switch protocols: code={}, reason='{}', raw_response={:?}",
+                            code, reason, raw
+                        )));
                     }
                     self.state = Completed;
                 }
@@ -117,6 +133,9 @@ impl Handshaker {
         outbound.write_all(b"Connection: upgrade\r\n")?;
         outbound.write_all(format!("Sec-WebSocket-Key: {}\r\n", generate_nonce()).as_bytes())?;
         outbound.write_all(b"Sec-WebSocket-Version: 13\r\n")?;
+        if let Some(extras) = &self.extra_headers {
+            outbound.write_all(extras.as_bytes())?;
+        }
         outbound.write_all(b"\r\n")?;
         self.state = PendingRequest;
         Ok(())
