@@ -557,7 +557,12 @@ mod __openssl {
                                     if verify != X509VerifyResult::OK {
                                         Err(io::Error::other(format!("{} {}", stream.error(), verify)))
                                     } else {
-                                        Err(io::Error::other(stream.error().to_string()))
+                                        // preserve the io error kind (e.g. connection refused / reset) so
+                                        // callers can classify handshake failures caused by transport errors
+                                        match stream.into_error().into_io_error() {
+                                            Ok(io_err) => Err(io_err),
+                                            Err(ssl_err) => Err(io::Error::other(ssl_err.to_string())),
+                                        }
                                     }
                                 }
                                 _ => Err(io::Error::other("TLS handshake failed")),
@@ -644,6 +649,19 @@ mod __openssl {
                     state: State::Handshake(Some((mid_handshake, Vec::with_capacity(4096)))),
                     plaintext_pending: false,
                 }),
+                Err(HandshakeError::Failure(stream)) => {
+                    let verify = stream.ssl().verify_result();
+                    if verify != X509VerifyResult::OK {
+                        Err(io::Error::other(format!("{} {}", stream.error(), verify)))
+                    } else {
+                        // preserve the io error kind so callers can classify handshake failures
+                        // caused by transport errors
+                        match stream.into_error().into_io_error() {
+                            Ok(io_err) => Err(io_err),
+                            Err(ssl_err) => Err(io::Error::other(ssl_err.to_string())),
+                        }
+                    }
+                }
                 Err(e) => Err(io::Error::other(e.to_string())),
             }
         }
