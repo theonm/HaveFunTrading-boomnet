@@ -1,7 +1,7 @@
 //! Provides TLS stream implementation for different backends.
 
 use crate::service::select::Selectable;
-use crate::stream::{ConnectionInfo, ConnectionInfoProvider};
+use crate::stream::{ConnectionInfo, ConnectionInfoProvider, ReadHint};
 #[cfg(feature = "openssl")]
 pub use __openssl::TlsStream;
 #[cfg(all(feature = "rustls", not(feature = "openssl")))]
@@ -15,6 +15,8 @@ use rustls::ClientConfig;
 use std::fmt::Debug;
 use std::io;
 use std::io::{Read, Write};
+#[cfg(target_family = "unix")]
+use std::os::fd::{AsRawFd, RawFd};
 
 /// Used to configure TLS backend.
 pub struct TlsConfig {
@@ -42,6 +44,17 @@ impl From<ClientConfig> for TlsConfig {
 pub trait TlsConfigExt {
     /// Disable certificate verification.
     fn with_no_cert_verification(&mut self);
+
+    /// Retain OpenSSL's TLS record buffers while a connection remains open.
+    ///
+    /// [`openssl::ssl::SslConnector`] enables `SSL_MODE_RELEASE_BUFFERS` by default. This reduces
+    /// memory consumption for idle connections, but can cause repeated allocation and deallocation
+    /// when a nonblocking connection is polled continuously.
+    ///
+    /// Retaining the buffers trades a small amount of memory per connection for more deterministic
+    /// receive latency.
+    #[cfg(feature = "openssl")]
+    fn with_retained_buffers(&mut self);
 
     #[cfg(feature = "openssl")]
     /// Try to resolve default certificate paths.
@@ -102,6 +115,24 @@ impl TlsConfigExt for TlsConfig {
     }
 
     #[cfg(feature = "openssl")]
+    fn with_retained_buffers(&mut self) {
+        // OpenSSL exposes SSL_CTX_clear_mode as a C macro around SSL_CTX_ctrl. openssl-sys does not
+        // currently expose that macro or its control constant directly.
+        const SSL_CTRL_CLEAR_MODE: std::ffi::c_int = 78;
+
+        // SAFETY: The pointer belongs to the live SslConnectorBuilder; SSL_CTX_ctrl does not take
+        // ownership of the context; and the control and mode values are part of OpenSSL's public ABI.
+        unsafe {
+            openssl_sys::SSL_CTX_ctrl(
+                self.openssl_config.as_ptr(),
+                SSL_CTRL_CLEAR_MODE,
+                openssl_sys::SSL_MODE_RELEASE_BUFFERS,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    #[cfg(feature = "openssl")]
     fn with_default_cert_paths(&mut self) {
         use log::warn;
         use std::path::PathBuf;
@@ -132,11 +163,31 @@ impl TlsConfigExt for TlsConfig {
     }
 }
 
+#[cfg(all(test, feature = "openssl"))]
+mod openssl_tests {
+    use super::{TlsConfig, TlsConfigExt};
+    use openssl::ssl::{SslConnector, SslMethod, SslMode};
+
+    #[test]
+    fn retained_buffers_disable_release_buffers_mode() {
+        let builder = SslConnector::builder(SslMethod::tls_client()).unwrap();
+        let mut config = TlsConfig::from(builder);
+
+        let initial_mode = config.as_openssl_mut().set_mode(SslMode::empty());
+        assert!(initial_mode.contains(SslMode::RELEASE_BUFFERS));
+
+        config.with_retained_buffers();
+
+        let retained_mode = config.as_openssl_mut().set_mode(SslMode::empty());
+        assert!(!retained_mode.contains(SslMode::RELEASE_BUFFERS));
+    }
+}
+
 #[cfg(all(feature = "rustls", not(feature = "openssl")))]
 mod __rustls {
     use crate::service::select::Selectable;
     use crate::stream::tls::TlsConfig;
-    use crate::stream::{ConnectionInfo, ConnectionInfoProvider};
+    use crate::stream::{ConnectionInfo, ConnectionInfoProvider, ReadHint};
     use crate::util::NoBlock;
     #[cfg(feature = "mio")]
     use mio::{Interest, Registry, Token, event::Source};
@@ -151,6 +202,8 @@ mod __rustls {
     use std::fmt::Debug;
     use std::io;
     use std::io::{Read, Write};
+    #[cfg(target_family = "unix")]
+    use std::os::fd::{AsRawFd, RawFd};
 
     pub struct TlsStream<S> {
         inner: S,
@@ -183,6 +236,23 @@ mod __rustls {
 
         fn make_readable(&mut self) -> io::Result<()> {
             self.inner.make_readable()
+        }
+    }
+
+    impl<S> ReadHint for TlsStream<S> {
+        #[inline]
+        fn read_hint(&self) -> bool {
+            // rustls can hold decrypted plaintext independently of the
+            // underlying transport. Until that state is exposed precisely,
+            // preserve its existing eager-read behavior.
+            true
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    impl<S: AsRawFd> AsRawFd for TlsStream<S> {
+        fn as_raw_fd(&self) -> RawFd {
+            self.inner.as_raw_fd()
         }
     }
 
@@ -330,7 +400,7 @@ mod __rustls {
 mod __openssl {
     use crate::service::select::Selectable;
     use crate::stream::tls::TlsConfig;
-    use crate::stream::{ConnectionInfo, ConnectionInfoProvider};
+    use crate::stream::{ConnectionInfo, ConnectionInfoProvider, ReadHint};
     #[cfg(feature = "mio")]
     use mio::{Interest, Registry, Token, event::Source};
     use openssl::ssl::{
@@ -342,6 +412,8 @@ mod __openssl {
     use std::io;
     use std::io::ErrorKind::WouldBlock;
     use std::io::{Read, Write};
+    #[cfg(target_family = "unix")]
+    use std::os::fd::{AsRawFd, RawFd};
 
     trait SslConnectionBuilderExt {
         fn setup_default_keylog_policy(&mut self);
@@ -369,6 +441,7 @@ mod __openssl {
     #[derive(Debug)]
     pub struct TlsStream<S> {
         state: State<S>,
+        plaintext_pending: bool,
     }
 
     #[derive(Debug)]
@@ -433,6 +506,37 @@ mod __openssl {
         }
     }
 
+    impl<S: ReadHint> ReadHint for TlsStream<S> {
+        #[inline]
+        fn read_hint(&self) -> bool {
+            match &self.state {
+                State::Handshake(_) | State::Drain(_) => true,
+                State::Stream(stream) => self.plaintext_pending || stream.get_ref().read_hint(),
+            }
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    impl<S: AsRawFd> AsRawFd for TlsStream<S> {
+        fn as_raw_fd(&self) -> RawFd {
+            match &self.state {
+                State::Handshake(stream_and_buf) => stream_and_buf
+                    .as_ref()
+                    .expect("TLS stream unavailable during handshake transition")
+                    .0
+                    .get_ref()
+                    .as_raw_fd(),
+                State::Drain(stream_and_buf) => stream_and_buf
+                    .as_ref()
+                    .expect("TLS stream unavailable during drain transition")
+                    .0
+                    .get_ref()
+                    .as_raw_fd(),
+                State::Stream(stream) => stream.get_ref().as_raw_fd(),
+            }
+        }
+    }
+
     impl<S: Read + Write> Read for TlsStream<S> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             match &mut self.state {
@@ -470,6 +574,7 @@ mod __openssl {
                     let remaining = &buffer[from..];
                     if remaining.is_empty() {
                         stream.flush()?;
+                        self.plaintext_pending = stream.ssl().pending() > 0;
                         self.state = State::Stream(stream);
                     } else {
                         from += stream.write(remaining)?;
@@ -477,7 +582,11 @@ mod __openssl {
                     }
                     Err(io::Error::from(WouldBlock))
                 }
-                State::Stream(stream) => stream.read(buf),
+                State::Stream(stream) => {
+                    let result = stream.read(buf);
+                    self.plaintext_pending = stream.ssl().pending() > 0;
+                    result
+                }
             }
         }
     }
@@ -524,11 +633,16 @@ mod __openssl {
 
             let connector = tls_config.openssl_config.build();
             match connector.connect(server_name, stream) {
-                Ok(stream) => Ok(Self {
-                    state: State::Stream(stream),
-                }),
+                Ok(stream) => {
+                    let plaintext_pending = stream.ssl().pending() > 0;
+                    Ok(Self {
+                        state: State::Stream(stream),
+                        plaintext_pending,
+                    })
+                }
                 Err(HandshakeError::WouldBlock(mid_handshake)) => Ok(Self {
                     state: State::Handshake(Some((mid_handshake, Vec::with_capacity(4096)))),
+                    plaintext_pending: false,
                 }),
                 Err(e) => Err(io::Error::other(e.to_string())),
             }
@@ -610,6 +724,16 @@ pub enum TlsReadyStream<S> {
     Tls(TlsStream<S>),
 }
 
+impl<S: ReadHint> ReadHint for TlsReadyStream<S> {
+    #[inline]
+    fn read_hint(&self) -> bool {
+        match self {
+            TlsReadyStream::Plain(stream) => stream.read_hint(),
+            TlsReadyStream::Tls(stream) => stream.read_hint(),
+        }
+    }
+}
+
 impl<S: Read + Write> Read for TlsReadyStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -687,6 +811,16 @@ impl<S: Selectable> Selectable for TlsReadyStream<S> {
         match self {
             TlsReadyStream::Plain(stream) => stream.make_readable(),
             TlsReadyStream::Tls(stream) => stream.make_readable(),
+        }
+    }
+}
+
+#[cfg(target_family = "unix")]
+impl<S: AsRawFd> AsRawFd for TlsReadyStream<S> {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            TlsReadyStream::Plain(stream) => stream.as_raw_fd(),
+            TlsReadyStream::Tls(stream) => stream.as_raw_fd(),
         }
     }
 }

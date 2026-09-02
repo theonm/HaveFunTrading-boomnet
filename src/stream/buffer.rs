@@ -1,12 +1,13 @@
 //! Stream that is buffering data written to it.
 
 use crate::service::select::Selectable;
-use crate::stream::{ConnectionInfo, ConnectionInfoProvider};
+use crate::stream::{ConnectionInfo, ConnectionInfoProvider, ReadHint};
 #[cfg(feature = "mio")]
 use mio::{Interest, Registry, Token, event::Source};
 use std::io;
 use std::io::{ErrorKind, Read, Write};
 use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, RawFd};
 
 /// Default buffer size in bytes.
 pub const DEFAULT_BUFFER_SIZE: usize = 1024;
@@ -53,9 +54,22 @@ pub struct BufferedStream<S, const N: usize = DEFAULT_BUFFER_SIZE> {
     cursor: usize,
 }
 
+impl<S: AsRawFd> AsRawFd for BufferedStream<S> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
 impl<S: Read, const N: usize> Read for BufferedStream<S, N> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
+    }
+}
+
+impl<S: ReadHint, const N: usize> ReadHint for BufferedStream<S, N> {
+    #[inline]
+    fn read_hint(&self) -> bool {
+        self.inner.read_hint()
     }
 }
 

@@ -120,6 +120,9 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpClient<C, CHUNK
 
     /// Prepare a request with custom headers and optional body.
     ///
+    /// Returns an error with [`io::ErrorKind::WouldBlock`] if the pool is unable to allocate a connection.
+    /// Other errors may be returned while acquiring the connection or preparing the request.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -138,6 +141,7 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpClient<C, CHUNK
     ///     }
     /// ).unwrap();
     /// ```
+    #[inline]
     pub fn new_request_with_headers<F>(
         &mut self,
         method: Method,
@@ -148,17 +152,14 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpClient<C, CHUNK
     where
         F: FnOnce(&mut Headers),
     {
-        builder(self.headers.clear());
-        let conn = self
-            .connection_pool
-            .borrow_mut()
-            .acquire()?
-            .ok_or_else(|| io::Error::other("no available connection"))?;
-        let request = HttpRequest::new(method, path, body, &self.headers, conn, self.connection_pool.clone())?;
-        Ok(request)
+        self.try_new_request_with_headers(method, path, body, builder)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no available connection in the pool"))
     }
 
     /// Prepare a request with no additional headers and optional body.
+    ///
+    /// Returns an error with [`io::ErrorKind::WouldBlock`] if the pool is unable to allocate a connection.
+    /// Other errors may be returned while acquiring the connection or preparing the request.
     ///
     /// # Examples
     ///
@@ -174,6 +175,7 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpClient<C, CHUNK
     ///     Some(b"data"),
     /// ).unwrap();
     /// ```
+    #[inline]
     pub fn new_request(
         &mut self,
         method: Method,
@@ -181,6 +183,91 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpClient<C, CHUNK
         body: Option<&[u8]>,
     ) -> io::Result<HttpRequest<C, CHUNK_SIZE>> {
         self.new_request_with_headers(method, path, body, |_| {})
+    }
+
+    /// Try to prepare a request with custom headers and optional body.
+    ///
+    /// Returns `Ok(None)` if the pool is unable to allocate a connection. In that case, no request is
+    /// prepared and `builder` is not called.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use http::Method;
+    /// use boomnet::http::{ConnectionPool, SingleTlsConnectionPool};
+    /// use boomnet::stream::ConnectionInfo;
+    ///
+    /// let mut client = SingleTlsConnectionPool::new(ConnectionInfo::new("example.com", 443)).into_http_client();
+    ///
+    /// match client.try_new_request_with_headers(
+    ///     Method::POST,
+    ///     "/submit",
+    ///     Some(b"data"),
+    ///     |hdrs| {
+    ///         hdrs["X-Custom"] = "Value";
+    ///     },
+    /// ).unwrap() {
+    ///     Some(request) => {
+    ///         let response = request.block().unwrap();
+    ///     }
+    ///     None => {
+    ///         // Try again after a connection becomes available.
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    pub fn try_new_request_with_headers<F>(
+        &mut self,
+        method: Method,
+        path: impl AsRef<str>,
+        body: Option<&[u8]>,
+        builder: F,
+    ) -> io::Result<Option<HttpRequest<C, CHUNK_SIZE>>>
+    where
+        F: FnOnce(&mut Headers),
+    {
+        let Some(conn) = self.connection_pool.borrow_mut().acquire()? else {
+            return Ok(None);
+        };
+
+        builder(self.headers.clear());
+
+        let request = HttpRequest::new(method, path, body, &self.headers, conn, self.connection_pool.clone())?;
+
+        Ok(Some(request))
+    }
+
+    /// Try to prepare a request with no additional headers and optional body.
+    ///
+    /// Returns `Ok(None)` if the pool is unable to allocate a connection. In that case, no request is
+    /// prepared.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use http::Method;
+    /// use boomnet::http::{ConnectionPool, SingleTlsConnectionPool};
+    /// use boomnet::stream::ConnectionInfo;
+    ///
+    /// let mut client = SingleTlsConnectionPool::new(ConnectionInfo::new("example.com", 443)).into_http_client();
+    ///
+    /// match client.try_new_request(Method::GET, "/", None).unwrap() {
+    ///     Some(request) => {
+    ///         let response = request.block().unwrap();
+    ///     }
+    ///     None => {
+    ///         // Try again after a connection becomes available.
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    pub fn try_new_request(
+        &mut self,
+        method: Method,
+        path: impl AsRef<str>,
+        body: Option<&[u8]>,
+    ) -> io::Result<Option<HttpRequest<C, CHUNK_SIZE>>> {
+        self.try_new_request_with_headers(method, path, body, |_| {})
     }
 }
 
@@ -446,6 +533,14 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpRequest<C, CHUN
             }
         }
         Ok(None)
+    }
+
+    /// Immediately terminate and consume this request.
+    ///
+    /// The request's connection is dropped instead of returned to the pool. Use this when the request
+    /// can no longer complete or its connection may not be safe to reuse, such as after a timeout.
+    pub fn invalidate(mut self) {
+        self.conn.take();
     }
 }
 

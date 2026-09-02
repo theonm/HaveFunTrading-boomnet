@@ -19,7 +19,7 @@ particularly focusing on TCP stream-oriented clients that utilise various protoc
 Simply declare dependency on `boomnet` in your `Cargo.toml` and select desired [features](#features).
 ```toml
 [dependencies]
-boomnet = { version = "0.0.77", features = ["rustls-webpki", "ws", "ext"]}
+boomnet = { version = "0.0.89", features = ["rustls-webpki", "ws", "ext", "mio"]}
 ```
 
 ## Design Principles
@@ -41,7 +41,7 @@ Streams are designed to be fully generic, avoiding dynamic dispatch, and can be 
 
 ```rust
 let stream: RecordedStream<TlsStream<TcpStream>> = TcpStream::try_from((host, port))?
-    .into_tls_stream()
+    .into_tls_stream()?
     .into_default_recorded_stream();
 ```
 
@@ -122,7 +122,7 @@ impl TlsWebsocketEndpoint for TradeEndpoint {
 
         let mut ws = TcpStream::try_from((&self.connection_info, addr))?
             .into_mio_stream()
-            .into_tls_websocket(&self.ws_endpoint);
+            .into_tls_websocket(&self.ws_endpoint)?;
 
         // send subscription message
         ws.send_text(
@@ -132,7 +132,9 @@ impl TlsWebsocketEndpoint for TradeEndpoint {
 
         Ok(Some(ws))
     }
+}
 
+impl TradeEndpoint {
     #[inline]
     fn poll(&mut self, ws: &mut TlsWebsocket<Self::Stream>) -> io::Result<()> {
         // iterate over available frames in the current batch
@@ -164,7 +166,8 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         // will never block
-        io_service.poll()?;
+        io_service.poll(|ws, endpoint| endpoint.poll(ws))?;
+
     }
 }
 ```
@@ -187,7 +190,9 @@ impl TlsWebsocketEndpointWithContext<FeedContext> for TradeEndpoint {
         // we now have access to context
         // ...
     }
+}
 
+impl TradeEndpoint {
     #[inline]
     fn poll(&mut self, ws: &mut TlsWebsocket<Self::Stream>, ctx: &mut FeedContext) -> io::Result<()> {
         // we now have access to context
@@ -204,10 +209,10 @@ let mut context = FeedContext::new();
 let mut io_service = MioSelector::new()?.into_io_service_with_context(&mut context);
 ```
 
-The `Context` must now be passed to the service `poll` method.
+The `Context` must now be passed to the endpoint method.
 ```rust
 loop {
-    io_service.poll(&mut context)?;
+    io_service.poll(&mut context, |ws, ctx, endpoint| endpoint.poll(ws, ctx))?;
 }
 ```
 
